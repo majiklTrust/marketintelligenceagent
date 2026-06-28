@@ -1,0 +1,405 @@
+/**
+#
+# Copyright (c) 2026 majiklTrust Market Intelligence, LLC. All rights reserved.
+#
+# This file is part of Market Intelligence and contains proprietary and
+# confidential information. Unauthorized copying, modification, distribution,
+# or use of this file, via any medium, is strictly prohibited without the
+# express written permission of the copyright holder.
+#
+
+**/
+
+import { Router } from "express";
+import Anthropic from "@anthropic-ai/sdk";
+import { createAuthMiddleware } from "../auth/middleware.js";
+import { createTenantResolver } from "../tenant/resolver.js";
+import { requirePermission } from "../tenant/permissions.js";
+import { hasPermission } from "../tenant/platform-db.js";
+import { withTenant } from "../db/with-tenant.js";
+import { platformLog } from "../services/platform-log.js";
+import { getFeedsManagerVersion } from "../config/research.js";
+import { getAnthropicApiKey } from "../tenant/credential-store.js";
+import { getAnthropicModel, callAnthropic } from "../config/ai.js";
+import { validateSearchTemplates, parseSuggestedTemplates } from "../services/search-queries.js";
+import { frameUntrustedContent } from "../services/prompt-framing.js";
+import {
+  listTopicsForUser,
+  getTopicById,
+  createTopic,
+  updateTopic,
+  toggleTopic,
+  deleteTopic
+} from "../tenant/topic-store.js";
+
+const router = Router();
+
+const { requireAuth } = createAuthMiddleware(platformLog);
+const resolveTenant = createTenantResolver();
+
+
+router.use(requireAuth);
+router.use(resolveTenant);
+router.use(requirePermission("manage_own_topics"));
+
+
+async function canManageAll(role) {
+  try { return await hasPermission(role, "manage_topics"); }
+  catch { return false; }
+}
+
+
+
+
+
+async function canModifyTopic(topic, userSub, role) {
+  if (await canManageAll(role)) return true;
+  
+  if (topic.user_sub && topic.user_sub === userSub) return true;
+  return false;
+}
+
+
+
+
+
+router.get("/", async (req, res) => {
+  try {
+    const isOwner = await canManageAll(req.tenant.role);
+    const { topics, fmVersion } = await withTenant(req.tenant.id, async () => {
+      return {
+        topics: await listTopicsForUser(req.user.sub, isOwner),
+        fmVersion: await getFeedsManagerVersion()
+      };
+    });
+    res.json({ topics, feedsManagerVersion: fmVersion });
+  } catch (err) {
+    platformLog("error", "topics_list_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to list topics" });
+  }
+});
+
+
+
+
+
+router.post("/", async (req, res) => {
+  try {
+    const { name, description, content_angles, hashtags, weight, scope, domains } = req.body || {};
+
+    if (!name || typeof name !== "string" || name.trim().length === 0) {
+      return res.status(400).json({ error: "Topic name is required" });
+    }
+
+    
+    
+    
+    const fmVersion = await withTenant(req.tenant.id, () => getFeedsManagerVersion());
+    const cleanDomains = (fmVersion === 2 && Array.isArray(domains))
+      ? [...new Set(domains.map(d => String(d).toLowerCase().trim().substring(0, 50)).filter(Boolean))].slice(0, 20)
+      : [];
+
+    const resolvedScope = scope || "personal";
+
+    
+    if (resolvedScope === "global") {
+      const allowed = await canManageAll(req.tenant.role);
+      if (!allowed) {
+        return res.status(403).json({ error: "Permission denied" });
+      }
+    }
+
+    const topic = await withTenant(req.tenant.id, async () => {
+      return createTopic({
+        name: name.trim(),
+        description: description || "",
+        contentAngles: content_angles || [],
+        hashtags: hashtags || [],
+        systemContext: req.body.system_context || "",
+        weight: weight || 1,
+        scope: resolvedScope,
+        callerSub: req.user.sub,
+        domains: cleanDomains
+      });
+    });
+
+    res.status(201).json(topic);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "A topic with this name already exists" });
+    }
+    platformLog("error", "topic_create_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to create topic" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+router.post("/:id/suggest-templates", async (req, res) => {
+  try {
+    const topic = await withTenant(req.tenant.id, async () => {
+      return getTopicById(req.params.id);
+    });
+    if (!topic) {
+      return res.status(404).json({ error: "Topic not found" });
+    }
+    const allowed = await canModifyTopic(topic, req.user.sub, req.tenant.role);
+    if (!allowed) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+
+    const apiKey = await withTenant(req.tenant.id, async () => {
+      return getAnthropicApiKey();
+    });
+    if (!apiKey) {
+      return res.status(503).json({ error: "Anthropic API key not configured" });
+    }
+    const client = new Anthropic({ apiKey });
+    const model = await withTenant(req.tenant.id, async () => {
+      return getAnthropicModel();
+    });
+
+    const angles = Array.isArray(topic.content_angles)
+      ? topic.content_angles.filter(a => typeof a === "string" && a.trim()).slice(0, 10)
+      : [];
+    const topicText =
+      "TOPIC NAME: " + (topic.name || "") + "\n" +
+      "DESCRIPTION: " + (topic.description || "") + "\n" +
+      "CONTENT ANGLES:\n" + angles.map(a => "- " + a).join("\n");
+    const framed = await withTenant(req.tenant.id, async () => {
+      return frameUntrustedContent(topicText);
+    });
+
+    const response = await callAnthropic(client, {
+      model,
+      max_tokens: 600,
+      messages: [{
+        role: "user",
+        content: `You are a research librarian configuring web searches for an AI news researcher. Based on the topic below, write 3 to 5 search query templates that would surface concrete, citable material (incident reports, regulatory actions, case studies, surveys with numbers) rather than generic explainers.
+
+${framed}
+
+Rules for each template:
+- a single line, under 200 characters
+- may use ONLY these placeholders: {{ANGLE}} {{KEYWORDS}} {{YEAR_RANGE}} {{TOPIC_NAME}}
+- fixed words should name a content TYPE (e.g. "incident report", "enforcement action", "case study results")
+
+Respond with ONLY a JSON array of template strings (no markdown, no preamble).`
+      }]
+    });
+
+    const text = response.content?.[0]?.text || "";
+    const suggestions = parseSuggestedTemplates(text);
+    if (suggestions.length === 0) {
+      platformLog("warn", "template_suggest_empty", { topicId: topic.id });
+      return res.status(502).json({ error: "Could not generate suggestions — please try again" });
+    }
+    platformLog("info", "template_suggestions_served", {
+      topicId: topic.id, slug: topic.slug, count: suggestions.length, suggestions
+    });
+    res.json({ suggestions });
+  } catch (err) {
+    platformLog("error", "template_suggest_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to generate suggestions" });
+  }
+});
+
+router.patch("/:id", async (req, res) => {
+  try {
+    const topic = await withTenant(req.tenant.id, async () => {
+      return getTopicById(req.params.id);
+    });
+    if (!topic) {
+      return res.status(404).json({ error: "Topic not found" });
+    }
+
+    const allowed = await canModifyTopic(topic, req.user.sub, req.tenant.role);
+    if (!allowed) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+
+    
+    
+    const body = { ...req.body };
+    if (body.domains !== undefined) {
+      if (await withTenant(req.tenant.id, () => getFeedsManagerVersion()) !== 2) {
+        delete body.domains;
+      } else {
+        body.domains = Array.isArray(body.domains)
+          ? [...new Set(body.domains.map(d => String(d).toLowerCase().trim().substring(0, 50)).filter(Boolean))].slice(0, 20)
+          : [];
+      }
+    }
+
+    
+    
+    
+    
+    if (body.search_templates !== undefined) {
+      const v = validateSearchTemplates(body.search_templates);
+      if (!v.ok) {
+        return res.status(400).json({ error: v.reason });
+      }
+      body.search_templates = v.templates;
+      platformLog("info", "search_templates_saved", {
+        topicId: req.params.id, count: v.templates.length, templates: v.templates
+      });
+    }
+
+    const updated = await withTenant(req.tenant.id, async () => {
+      return updateTopic(req.params.id, body);
+    });
+    if (!updated) {
+      return res.status(400).json({ error: "No valid fields to update" });
+    }
+    res.json(updated);
+  } catch (err) {
+    platformLog("error", "topic_update_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to update topic" });
+  }
+});
+
+
+
+
+
+router.post("/:id/toggle", async (req, res) => {
+  try {
+    const topic = await withTenant(req.tenant.id, async () => {
+      return getTopicById(req.params.id);
+    });
+    if (!topic) {
+      return res.status(404).json({ error: "Topic not found" });
+    }
+
+    const allowed = await canModifyTopic(topic, req.user.sub, req.tenant.role);
+    if (!allowed) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+
+    const { enabled } = req.body || {};
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled must be a boolean" });
+    }
+
+    const updated = await withTenant(req.tenant.id, async () => {
+      return toggleTopic(req.params.id, enabled);
+    });
+    res.json(updated);
+  } catch (err) {
+    platformLog("error", "topic_toggle_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to toggle topic" });
+  }
+});
+
+
+
+
+
+router.delete("/:id", async (req, res) => {
+  try {
+    const topic = await withTenant(req.tenant.id, async () => {
+      return getTopicById(req.params.id);
+    });
+    if (!topic) {
+      return res.status(404).json({ error: "Topic not found" });
+    }
+
+    const allowed = await canModifyTopic(topic, req.user.sub, req.tenant.role);
+    if (!allowed) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+
+    await withTenant(req.tenant.id, async () => {
+      return deleteTopic(req.params.id);
+    });
+    res.json({ success: true });
+  } catch (err) {
+    platformLog("error", "topic_delete_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to delete topic" });
+  }
+});
+
+
+
+
+
+router.post("/generate", async (req, res) => {
+  try {
+    const { name, description } = req.body || {};
+
+    if (!name || typeof name !== "string" || name.trim().length === 0) {
+      return res.status(400).json({ error: "Topic name is required" });
+    }
+    if (!description || typeof description !== "string" || description.trim().length === 0) {
+      return res.status(400).json({ error: "Topic description is required" });
+    }
+
+    
+    const apiKey = await withTenant(req.tenant.id, async () => {
+      return getAnthropicApiKey();
+    });
+    if (!apiKey) {
+      return res.status(503).json({ error: "Anthropic API key not configured" });
+    }
+
+    const client = new Anthropic({ apiKey });
+    const model = await withTenant(req.tenant.id, async () => {
+      return getAnthropicModel();
+    });
+
+    const response = await callAnthropic(client, {
+      model,
+      max_tokens: 1500,
+      messages: [{
+        role: "user",
+        content: `You are a content strategy expert. Given a LinkedIn content topic, generate specific, actionable suggestions.
+
+TOPIC NAME: ${name.trim()}
+DESCRIPTION: ${description.trim()}
+
+Respond with ONLY valid JSON (no markdown, no preamble):
+{
+  "content_angles": [
+    "10 specific content angles for LinkedIn posts — each should be a concrete, actionable idea"
+  ],
+  "hashtags": [
+    "4 to 6 relevant LinkedIn hashtags including the # symbol"
+  ],
+  "system_context": "A system prompt for an AI content writer. Define the persona, tone, focus areas, what to include, and what to avoid. 4-6 sentences."
+}`
+      }]
+    });
+
+    const text = response.content?.[0]?.text || "";
+    let parsed;
+    try {
+      const cleaned = text.replace(/```json|```/g, "").trim();
+      parsed = JSON.parse(cleaned);
+    } catch {
+      platformLog("warn", "topic_generate_parse_failed", { raw: text.substring(0, 200) });
+      return res.status(500).json({ error: "Failed to parse AI response" });
+    }
+
+    
+    
+    res.json({
+      content_angles: parsed.content_angles || [],
+      hashtags: parsed.hashtags || [],
+      _system_context: parsed.system_context || ""
+    });
+  } catch (err) {
+    platformLog("error", "topic_generate_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to generate topic suggestions" });
+  }
+});
+
+export default router;

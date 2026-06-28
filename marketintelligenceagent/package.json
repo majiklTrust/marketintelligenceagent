@@ -1,0 +1,59 @@
+{
+  "license": "SEE LICENSE FILE AT PROJECT ROOT",
+  "name": "marketintelligence-agent",
+  "version": "1.9.35",
+  "config": {
+    "cssversion": "35.0",
+    "appname": "Market Intelligence"
+  },
+  "description": "AI for Market Intelligence content creation",
+  "main": "src/index.js",
+  "type": "module",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "scripts": {
+    "cssversion": "node cssversion.js && npm run build",
+    "build": "echo && echo \\* \\* \\* \\* \\* \\* \\* \\* \\* \\* \\* running build: build_alpha build_admin build_html build_js \\* \\* \\* \\* \\* \\* \\* \\* \\* \\* \\* && npm run build_alpha && npm run build_admin && npm run build_html && npm run build_js && echo installed version $npm_package_name-$npm_package_version",
+    "build_alpha": "CSSVERSION=$(node -p \"require('./package.json').config.cssversion\") && sed \"s/{{CSSVERSION}}/$CSSVERSION/\" majikl-site/site_templates/index.html >majikl-site/index.html",
+    "build_admin": "CSSVERSION=$(node -p \"require('./package.json').config.cssversion\") && sed \"s/{{CSSVERSION}}/$CSSVERSION/\" public_templates/platform-admin/index.html >public/platform-admin/index.html",
+    "build_html": "APPVERSION=$(node -p \"require('./package.json').version\") && CSSVERSION=$(node -p \"require('./package.json').config.cssversion\") && APP_NAME=$(node -p \"require('./package.json').config.appname\") && sed -e \"s/{{CSSVERSION}}/$CSSVERSION/\" -e \"s/{{VERSION}}/$APPVERSION/\" -e \"s/{{APPLICATION}}/$APP_NAME/\" public_templates/index.html >public/index.html",
+    "build_js": "APPVERSION=$(node -p \"require('./package.json').version\") && sed \"s/{{VERSION}}/$APPVERSION/\" src_templates/index.js >src/index.js",
+    "100_": "",
+    "start": "npm run timesync && node src/index.js",
+    "nodemon": "npx nodemon --require ./scripts/suppress-warnings.cjs --require ./scripts/traffic-monitor.cjs src/index.js",
+    "getvars": "echo \"\\nPGHOST:$PGHOST\\nPGPORT:$PGPORT\\nPGUSER:$PGUSER\\nPGDATABASE:$PGDATABASE\"",
+    "production": "npm ci --ignore-scripts --omit=dev && npm run getvars && NODE_ENV=production npm run start",
+    "nonproddb": "npm run nonprod",
+    "nonprod": "npm run getvars && NODE_ENV=nonprod npm run nodemon",
+    "devdb": "npm run nonprod",
+    "dev": "npm run getvars && NODE_ENV=dev DEV_BYPASS_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,http://172.16.11.101:3001 DEV_BYPASS_SUB=\"auth0|69c809a92adfb474a6b2a3f3\" npm run nodemon",
+    "status": "curl -s http://localhost:3001/api/status | python3 -m json.tool",
+    "login": "curl -I http://localhost:3001/auth/login",
+    "logout": "curl -I http://localhost:3001/auth/logout",
+    "feeds": "curl -s http://localhost:3001/api/feeds  | jq '.feeds'",
+    "batch-test": "PGUSER=mjagt_app_runtime bash scripts/testing/batch-run-test.sh",
+    "batch_test": "npm run batch-test",
+    "showtests": "npm run batch-test -- show",
+    "testall": "npm run batch-test -- all"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.104",
+    "axios": "^1.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.18.0",
+    "jose": "^6.2.2",
+    "node-cron": "^4.4.1",
+    "open": "^10.0.0",
+    "pg": "^8.20.0",
+    "rss-parser": "^3.13.0",
+    "uuid": "^14.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "json-stringify-safe": "^5.0.1",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.2.2"
+  }
+}
